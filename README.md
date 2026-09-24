@@ -1,6 +1,5 @@
 -- language: Lua, target: Roblox (universal), runtime: exploit executor
--- ESP por detecção de Humanoid — não depende de player.Character
--- zero scan em loop, event-driven, uma varredura inicial única
+-- ESP leve — cache agressivo, sem GetBoundingBox, team check corrigido
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -32,9 +31,81 @@ local Conns = {}
 local function Trk(c) table.insert(Conns, c) return c end
 
 -- ══════════════════════════════════════════
---  TRACKING POR HUMANOID (não por player)
+--  MAPEAMENTO PLAYER <-> CHARACTER (via eventos)
 -- ══════════════════════════════════════════
-local Tracked = {} -- model -> {Player, Draw}
+local CharToPlayer = {}
+
+local function MapChar(player)
+    if player == LocalPlayer then return end
+    local char = player.Character
+    if char then CharToPlayer[char] = player end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    MapChar(p)
+    pcall(function()
+        Trk(p.CharacterAdded:Connect(function(char)
+            CharToPlayer[char] = p
+        end))
+    end)
+end
+
+Trk(Players.PlayerAdded:Connect(function(p)
+    if p == LocalPlayer then return end
+    MapChar(p)
+    pcall(function()
+        Trk(p.CharacterAdded:Connect(function(char)
+            CharToPlayer[char] = p
+        end))
+    end)
+end))
+
+Trk(Players.PlayerRemoving:Connect(function(p)
+    -- limpa referências
+    for char, pl in pairs(CharToPlayer) do
+        if pl == p then CharToPlayer[char] = nil end
+    end
+end))
+
+-- ══════════════════════════════════════════
+--  TEAM CHECK — Team + TeamColor
+-- ══════════════════════════════════════════
+local function IsEnemy(player)
+    if not player then return true end
+    if not Config.TeamCheck then return true end
+
+    -- método 1: Team object (mais confiável)
+    local myTeam = LocalPlayer.Team
+    local theirTeam = player.Team
+    if myTeam and theirTeam then
+        return myTeam ~= theirTeam
+    end
+
+    -- método 2: TeamColor (PF e muitos FPS usam isso)
+    local myColor = LocalPlayer.TeamColor
+    local theirColor = player.TeamColor
+    if myColor and theirColor then
+        -- só compara se não for a cor default (White)
+        if myColor ~= BrickColor.new("White") then
+            return myColor ~= theirColor
+        end
+    end
+
+    -- método 3: Neutral flag
+    if player.Neutral ~= LocalPlayer.Neutral then
+        return true
+    end
+    if LocalPlayer.Neutral then
+        return true -- FFA
+    end
+
+    return true
+end
+
+-- ══════════════════════════════════════════
+--  TRACKING + CACHE
+-- ══════════════════════════════════════════
+local Tracked = {} -- model -> data
 
 local function SafeDraw(class, props)
     local ok, obj = pcall(Drawing.new, class)
@@ -58,14 +129,12 @@ end
 
 local function Hide(d)
     if not d then return end
-    pcall(function()
-        for i=1,4 do if d.Box[i] then d.Box[i].Visible=false end end
-        if d.Name then d.Name.Visible=false end
-        if d.HpBG then d.HpBG.Visible=false end
-        if d.HpFill then d.HpFill.Visible=false end
-        if d.Dist then d.Dist.Visible=false end
-        if d.Tracer then d.Tracer.Visible=false end
-    end)
+    for i=1,4 do if d.Box[i] then d.Box[i].Visible=false end end
+    if d.Name then d.Name.Visible=false end
+    if d.HpBG then d.HpBG.Visible=false end
+    if d.HpFill then d.HpFill.Visible=false end
+    if d.Dist then d.Dist.Visible=false end
+    if d.Tracer then d.Tracer.Visible=false end
 end
 
 local function DestroyDraw(d)
@@ -80,48 +149,70 @@ local function DestroyDraw(d)
     end)
 end
 
--- identifica a que player pertence um model
-local function MatchPlayer(model)
-    -- método 1: API padrão
-    local ok, player = pcall(Players.GetPlayerFromCharacter, Players, model)
-    if ok and player then return player end
-
-    -- método 2: nome do model = nome do player
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p.Name == model.Name or p.DisplayName == model.Name then
-            return p
-        end
+-- acha root part UMA VEZ e cacheia
+local function CacheRoot(model)
+    local p = model.PrimaryPart
+    if p and p:IsA("BasePart") then return p end
+    local names = {"HumanoidRootPart","RootPart","Torso","UpperTorso","LowerTorso","Head"}
+    for _, n in ipairs(names) do
+        p = model:FindFirstChild(n)
+        if p and p:IsA("BasePart") then return p end
     end
-
-    return nil
+    return model:FindFirstChildWhichIsA("BasePart", true)
 end
 
--- checa se é o character do local player
-local function IsLocalChar(model)
-    local p = MatchPlayer(model)
-    if p == LocalPlayer then return true end
-    -- checa também por referência direta
-    if LocalPlayer.Character and LocalPlayer.Character == model then return true end
-    return false
-end
-
--- registra um model que tem Humanoid
 local function TrackModel(model)
     if not model or not model:IsA("Model") then return end
     if Tracked[model] then return end
-    if IsLocalChar(model) then return end
 
-    local player = MatchPlayer(model)
+    -- ignora local player
+    local player = CharToPlayer[model]
+    if not player then
+        -- tenta API
+        local ok, p = pcall(Players.GetPlayerFromCharacter, Players, model)
+        if ok and p then
+            player = p
+            CharToPlayer[model] = p
+        end
+    end
+    if player == LocalPlayer then return end
+
+    -- sem player mapeado, tenta por nome
+    if not player then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and (p.Name == model.Name or p.DisplayName == model.Name) then
+                player = p
+                CharToPlayer[model] = p
+                break
+            end
+        end
+    end
+
     local d = NewDraw()
     if not d then return end
 
+    local root = CacheRoot(model)
+    local hum = model:FindFirstChildOfClass("Humanoid")
+
     Tracked[model] = {
-        Player = player, -- pode ser nil (NPC ou match falhou)
+        Player = player,
         Draw = d,
+        Root = root,     -- cacheado
+        Hum = hum,       -- cacheado
     }
+
+    -- atualiza cache se partes forem adicionadas depois
+    Trk(model.ChildAdded:Connect(function(child)
+        local data = Tracked[model]
+        if not data then return end
+        if child:IsA("Humanoid") then
+            data.Hum = child
+        elseif child:IsA("BasePart") and not data.Root then
+            data.Root = child
+        end
+    end))
 end
 
--- remove tracking
 local function UntrackModel(model)
     local data = Tracked[model]
     if not data then return end
@@ -131,15 +222,12 @@ local function UntrackModel(model)
 end
 
 -- ══════════════════════════════════════════
---  DETECÇÃO PASSIVA — EVENTS
+--  DETECÇÃO PASSIVA
 -- ══════════════════════════════════════════
-
--- quando um Humanoid aparece em qualquer lugar do workspace
 Trk(workspace.DescendantAdded:Connect(function(desc)
     if desc:IsA("Humanoid") then
         local model = desc.Parent
         if model and model:IsA("Model") then
-            -- delay pra deixar o jogo montar o character completo
             task.defer(function()
                 task.wait(1)
                 if model and model.Parent then
@@ -150,20 +238,16 @@ Trk(workspace.DescendantAdded:Connect(function(desc)
     end
 end))
 
--- quando um Humanoid é removido
 Trk(workspace.DescendantRemoving:Connect(function(desc)
     if desc:IsA("Humanoid") then
         local model = desc.Parent
-        if model then
-            UntrackModel(model)
-        end
+        if model then UntrackModel(model) end
     end
 end))
 
--- scan inicial ÚNICO (não em loop) — pega characters que já existem
+-- scan inicial único
 task.defer(function()
-    local descs = workspace:GetDescendants()
-    for _, desc in ipairs(descs) do
+    for _, desc in ipairs(workspace:GetDescendants()) do
         if desc:IsA("Humanoid") then
             local model = desc.Parent
             if model and model:IsA("Model") and model.Parent then
@@ -171,194 +255,145 @@ task.defer(function()
             end
         end
     end
-    descs = nil -- libera a tabela
 end)
 
--- também ouve CharacterAdded de cada player como complemento
-for _, player in ipairs(Players:GetPlayers()) do
-    if player ~= LocalPlayer then
-        pcall(function()
-            Trk(player.CharacterAdded:Connect(function(char)
-                task.wait(1.5)
-                if char and char.Parent then
-                    TrackModel(char)
-                end
-            end))
-        end)
-    end
-end
-
-Trk(Players.PlayerAdded:Connect(function(player)
-    if player ~= LocalPlayer then
-        pcall(function()
-            Trk(player.CharacterAdded:Connect(function(char)
-                task.wait(1.5)
-                if char and char.Parent then
-                    TrackModel(char)
-                end
-            end))
-        end)
-    end
-end))
-
-Trk(Players.PlayerRemoving:Connect(function(player)
-    -- remove todos os models desse player
-    for model, data in pairs(Tracked) do
-        if data.Player == player then
-            UntrackModel(model)
-        end
-    end
-end))
-
 -- ══════════════════════════════════════════
---  UTILIDADES
--- ══════════════════════════════════════════
-
-local function FindPart(model)
-    local p = model.PrimaryPart
-    if p and p:IsA("BasePart") and p.Parent then return p end
-    local names = {"HumanoidRootPart","RootPart","Torso","UpperTorso","LowerTorso","Head"}
-    for _, n in ipairs(names) do
-        p = model:FindFirstChild(n)
-        if p and p:IsA("BasePart") and p.Parent then return p end
-    end
-    p = model:FindFirstChildWhichIsA("BasePart", true)
-    return p
-end
-
-local function IsEnemy(player)
-    if not player then return true end -- sem player mapeado = mostra como inimigo
-    if not Config.TeamCheck then return true end
-    local ok, r = pcall(function()
-        if not LocalPlayer.Team or not player.Team then return true end
-        return LocalPlayer.Team ~= player.Team
-    end)
-    return ok and r or true
-end
-
-local function GetLabel(model, player)
-    if player then return player.DisplayName or player.Name end
-    return model.Name or "?"
-end
-
--- ══════════════════════════════════════════
---  RENDER
+--  RENDER — LEVE
 -- ══════════════════════════════════════════
 local frameN = 0
 
-local function Render()
+local RC = RunService.RenderStepped:Connect(function()
     frameN = frameN + 1
-    if frameN % 2 ~= 0 then return end
+    if frameN % 3 ~= 0 then return end -- ~20hz
 
     local cam = workspace.CurrentCamera
     if not cam then return end
+    local camPos = cam.CFrame.Position
 
     for model, data in pairs(Tracked) do
         local d = data.Draw
-        local player = data.Player
 
-        if not Config.Enabled then
-            Hide(d)
-        elseif not model or not model.Parent then
-            Hide(d)
-        elseif Config.TeamCheck and not IsEnemy(player) then
+        -- checks rápidos sem pcall
+        if not Config.Enabled or not model.Parent then
             Hide(d)
         else
-            -- checa humanoid vivo
-            local hum = model:FindFirstChildOfClass("Humanoid")
-            if hum then
-                local ok, dead = pcall(function() return hum.Health <= 0 end)
-                if ok and dead then
-                    Hide(d)
-                    -- pula pra próximo sem usar 'continue'
-                    hum = nil
-                end
+            -- atualiza root se perdeu referência
+            local root = data.Root
+            if not root or not root.Parent then
+                root = CacheRoot(model)
+                data.Root = root
             end
 
-            if not model.Parent then
+            if not root or not root.Parent then
                 Hide(d)
-            elseif hum == nil and model:FindFirstChildOfClass("Humanoid") then
-                -- morto, já escondeu acima
             else
-                local part = FindPart(model)
-                if not part then
+                -- alive check
+                local hum = data.Hum
+                if not hum or not hum.Parent then
+                    hum = model:FindFirstChildOfClass("Humanoid")
+                    data.Hum = hum
+                end
+
+                local dead = false
+                if hum then
+                    dead = hum.Health <= 0
+                end
+
+                if dead then
                     Hide(d)
                 else
-                    local pos = part.Position
-                    local dist = (cam.CFrame.Position - pos).Magnitude
+                    -- team check
+                    local player = data.Player
+                    if not player then
+                        player = CharToPlayer[model]
+                        data.Player = player
+                    end
 
-                    if dist > Config.MaxDistance then
+                    if Config.TeamCheck and not IsEnemy(player) then
                         Hide(d)
                     else
-                        -- bounding box real ou estimada
-                        local halfY = 3.2
-                        local wRatio = 0.55
+                        local pos = root.Position
+                        local dx = camPos.X - pos.X
+                        local dy = camPos.Y - pos.Y
+                        local dz = camPos.Z - pos.Z
+                        local dist = (dx*dx + dy*dy + dz*dz) -- sem sqrt pra comparar
+                        local maxD = Config.MaxDistance
 
-                        local ok2, cf, sz = pcall(function() return model:GetBoundingBox() end)
-                        if ok2 and cf and sz and sz.Y > 0.5 then
-                            halfY = sz.Y / 2
-                            wRatio = math.clamp(math.max(sz.X, sz.Z) / sz.Y, 0.3, 0.8)
-                            pos = cf.Position
-                        end
-
-                        local ts, tv = cam:WorldToViewportPoint(pos + Vector3.new(0, halfY, 0))
-                        local bs, bv = cam:WorldToViewportPoint(pos - Vector3.new(0, halfY, 0))
-
-                        if (ts.Z < 0 and bs.Z < 0) or (not tv and not bv) then
+                        if dist > maxD * maxD then
                             Hide(d)
                         else
-                            local h = math.abs(bs.Y - ts.Y)
-                            if h < 3 then
+                            dist = math.sqrt(dist) -- sqrt só quando precisa
+
+                            local top = pos + Vector3.new(0, 3.2, 0)
+                            local bot = pos - Vector3.new(0, 3.2, 0)
+                            local ts, tv = cam:WorldToViewportPoint(top)
+                            local bs, bv = cam:WorldToViewportPoint(bot)
+
+                            if (ts.Z < 0 and bs.Z < 0) or (not tv and not bv) then
                                 Hide(d)
                             else
-                                local w = h * wRatio
-                                local cx = (ts.X + bs.X) / 2
-                                local color = IsEnemy(player) and Config.EnemyColor or Config.TeamColor
-
-                                if Config.ShowBox then
-                                    local tl=Vector2.new(cx-w/2,ts.Y)
-                                    local tr=Vector2.new(cx+w/2,ts.Y)
-                                    local bl=Vector2.new(cx-w/2,bs.Y)
-                                    local br=Vector2.new(cx+w/2,bs.Y)
-                                    d.Box[1].From=tl;d.Box[1].To=tr
-                                    d.Box[2].From=tr;d.Box[2].To=br
-                                    d.Box[3].From=br;d.Box[3].To=bl
-                                    d.Box[4].From=bl;d.Box[4].To=tl
-                                    for i=1,4 do d.Box[i].Color=color;d.Box[i].Thickness=Config.BoxThickness;d.Box[i].Visible=true end
+                                local h = math.abs(bs.Y - ts.Y)
+                                if h < 3 then
+                                    Hide(d)
                                 else
-                                    for i=1,4 do d.Box[i].Visible=false end
+                                    local w = h * 0.55
+                                    local cx = (ts.X + bs.X) * 0.5
+                                    local color = IsEnemy(player) and Config.EnemyColor or Config.TeamColor
+
+                                    -- BOX
+                                    if Config.ShowBox then
+                                        local tl=Vector2.new(cx-w*0.5,ts.Y)
+                                        local tr=Vector2.new(cx+w*0.5,ts.Y)
+                                        local bl=Vector2.new(cx-w*0.5,bs.Y)
+                                        local br=Vector2.new(cx+w*0.5,bs.Y)
+                                        d.Box[1].From=tl;d.Box[1].To=tr
+                                        d.Box[2].From=tr;d.Box[2].To=br
+                                        d.Box[3].From=br;d.Box[3].To=bl
+                                        d.Box[4].From=bl;d.Box[4].To=tl
+                                        for i=1,4 do d.Box[i].Color=color;d.Box[i].Thickness=Config.BoxThickness;d.Box[i].Visible=true end
+                                    else
+                                        for i=1,4 do d.Box[i].Visible=false end
+                                    end
+
+                                    -- NAME
+                                    if Config.ShowName then
+                                        d.Name.Position=Vector2.new(cx,ts.Y-Config.TextSize-2)
+                                        if player then
+                                            d.Name.Text=player.DisplayName or player.Name
+                                        else
+                                            d.Name.Text=model.Name
+                                        end
+                                        d.Name.Color=color;d.Name.Size=Config.TextSize;d.Name.Visible=true
+                                    else d.Name.Visible=false end
+
+                                    -- HP
+                                    if Config.ShowHealth and hum then
+                                        local mx=hum.MaxHealth;if mx<=0 then mx=100 end
+                                        local frac=math.clamp(hum.Health/mx,0,1)
+                                        local bx=cx-w*0.5-5
+                                        d.HpBG.From=Vector2.new(bx,ts.Y);d.HpBG.To=Vector2.new(bx,bs.Y);d.HpBG.Visible=true
+                                        local ft=bs.Y-(bs.Y-ts.Y)*frac
+                                        d.HpFill.From=Vector2.new(bx,ft);d.HpFill.To=Vector2.new(bx,bs.Y)
+                                        local r2,g2=1,1
+                                        if frac<0.5 then g2=frac*2 else r2=1-(frac-0.5)*2 end
+                                        d.HpFill.Color=Color3.new(r2,g2,0);d.HpFill.Visible=true
+                                    else d.HpBG.Visible=false;d.HpFill.Visible=false end
+
+                                    -- DIST
+                                    if Config.ShowDistance then
+                                        d.Dist.Position=Vector2.new(cx,bs.Y+2)
+                                        d.Dist.Text="["..tostring(math.floor(dist)).."]"
+                                        d.Dist.Color=color;d.Dist.Size=Config.TextSize-1;d.Dist.Visible=true
+                                    else d.Dist.Visible=false end
+
+                                    -- TRACER
+                                    if Config.ShowTracers then
+                                        local vs=cam.ViewportSize
+                                        d.Tracer.From=Vector2.new(vs.X*0.5,vs.Y)
+                                        d.Tracer.To=Vector2.new(cx,bs.Y)
+                                        d.Tracer.Color=color;d.Tracer.Visible=true
+                                    else d.Tracer.Visible=false end
                                 end
-
-                                if Config.ShowName then
-                                    d.Name.Position=Vector2.new(cx,ts.Y-Config.TextSize-2)
-                                    d.Name.Text=GetLabel(model, player)
-                                    d.Name.Color=color;d.Name.Size=Config.TextSize;d.Name.Visible=true
-                                else d.Name.Visible=false end
-
-                                if Config.ShowHealth and hum then
-                                    local mx = hum.MaxHealth; if mx <= 0 then mx = 100 end
-                                    local frac = math.clamp(hum.Health/mx, 0, 1)
-                                    local bx = cx-w/2-5
-                                    d.HpBG.From=Vector2.new(bx,ts.Y);d.HpBG.To=Vector2.new(bx,bs.Y);d.HpBG.Visible=true
-                                    local ft=bs.Y-(bs.Y-ts.Y)*frac
-                                    d.HpFill.From=Vector2.new(bx,ft);d.HpFill.To=Vector2.new(bx,bs.Y)
-                                    local r2,g2=1,1
-                                    if frac<0.5 then g2=frac*2 else r2=1-(frac-0.5)*2 end
-                                    d.HpFill.Color=Color3.new(r2,g2,0);d.HpFill.Visible=true
-                                else d.HpBG.Visible=false;d.HpFill.Visible=false end
-
-                                if Config.ShowDistance then
-                                    d.Dist.Position=Vector2.new(cx,bs.Y+2)
-                                    d.Dist.Text="["..tostring(math.floor(dist)).."]"
-                                    d.Dist.Color=color;d.Dist.Size=Config.TextSize-1;d.Dist.Visible=true
-                                else d.Dist.Visible=false end
-
-                                if Config.ShowTracers then
-                                    local vs=cam.ViewportSize
-                                    d.Tracer.From=Vector2.new(vs.X/2,vs.Y)
-                                    d.Tracer.To=Vector2.new(cx,bs.Y)
-                                    d.Tracer.Color=color;d.Tracer.Visible=true
-                                else d.Tracer.Visible=false end
                             end
                         end
                     end
@@ -366,14 +401,12 @@ local function Render()
             end
         end
     end
-end
-
-local RC = RunService.RenderStepped:Connect(function() pcall(Render) end)
+end)
 
 -- ══════════════════════════════════════════
 --  GUI
 -- ══════════════════════════════════════════
-local SG=Instance.new("ScreenGui"); SG.Name="UESP"; SG.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; SG.ResetOnSpawn=false
+local SG=Instance.new("ScreenGui");SG.Name="UESP";SG.ZIndexBehavior=Enum.ZIndexBehavior.Sibling;SG.ResetOnSpawn=false
 pcall(function()
     if gethui then SG.Parent=gethui()
     elseif syn and syn.protect_gui then syn.protect_gui(SG);SG.Parent=game:GetService("CoreGui")
@@ -392,14 +425,14 @@ Instance.new("UICorner",TB).CornerRadius=UDim.new(0,8)
 local tp=Instance.new("Frame");tp.Size=UDim2.new(1,0,0,10);tp.Position=UDim2.new(0,0,1,-10);tp.BackgroundColor3=Th.Top;tp.BorderSizePixel=0;tp.Parent=TB
 local tl=Instance.new("TextLabel");tl.Size=UDim2.new(1,-60,1,0);tl.Position=UDim2.new(0,12,0,0);tl.BackgroundTransparency=1
 tl.Text="ESP";tl.TextColor3=Th.Acc;tl.TextSize=14;tl.Font=Enum.Font.GothamBold;tl.TextXAlignment=Enum.TextXAlignment.Left;tl.Parent=TB
-local mb=Instance.new("TextButton");mb.Size=UDim2.new(0,28,0,22);mb.Position=UDim2.new(1,-36,0.5,-11)
-mb.BackgroundColor3=Th.El;mb.BorderSizePixel=0;mb.Text="-";mb.TextColor3=Th.Dm;mb.TextSize=14;mb.Font=Enum.Font.GothamBold;mb.Parent=TB
-Instance.new("UICorner",mb).CornerRadius=UDim.new(0,4)
+local mmb=Instance.new("TextButton");mmb.Size=UDim2.new(0,28,0,22);mmb.Position=UDim2.new(1,-36,0.5,-11)
+mmb.BackgroundColor3=Th.El;mmb.BorderSizePixel=0;mmb.Text="-";mmb.TextColor3=Th.Dm;mmb.TextSize=14;mmb.Font=Enum.Font.GothamBold;mmb.Parent=TB
+Instance.new("UICorner",mmb).CornerRadius=UDim.new(0,4)
 
 local CT=Instance.new("ScrollingFrame");CT.Size=UDim2.new(1,-16,1,-40);CT.Position=UDim2.new(0,8,0,36)
 CT.BackgroundTransparency=1;CT.BorderSizePixel=0;CT.ScrollBarThickness=3;CT.ScrollBarImageColor3=Th.Acc
 CT.CanvasSize=UDim2.new(0,0,0,0);CT.AutomaticCanvasSize=Enum.AutomaticSize.Y;CT.Parent=MF
-local cl=Instance.new("UIListLayout");cl.SortOrder=Enum.SortOrder.LayoutOrder;cl.Padding=UDim.new(0,4);cl.Parent=CT
+local cll=Instance.new("UIListLayout");cll.SortOrder=Enum.SortOrder.LayoutOrder;cll.Padding=UDim.new(0,4);cll.Parent=CT
 
 local LO=0;local function NO() LO=LO+1;return LO end
 
@@ -445,14 +478,14 @@ local function Sld(n,mn,mx,def,cb)
     Instance.new("UICorner",sb).CornerRadius=UDim.new(1,0)
     local sf=Instance.new("Frame");sf.Size=UDim2.new((val-mn)/(mx-mn),0,1,0);sf.BackgroundColor3=Th.SFl;sf.BorderSizePixel=0;sf.Parent=sb
     Instance.new("UICorner",sf).CornerRadius=UDim.new(1,0)
-    local kn=Instance.new("Frame");kn.Size=UDim2.new(0,12,0,12);kn.AnchorPoint=Vector2.new(0.5,0.5)
-    kn.Position=UDim2.new((val-mn)/(mx-mn),0,0.5,0);kn.BackgroundColor3=Color3.new(1,1,1);kn.BorderSizePixel=0;kn.ZIndex=2;kn.Parent=sb
-    Instance.new("UICorner",kn).CornerRadius=UDim.new(1,0)
+    local skn=Instance.new("Frame");skn.Size=UDim2.new(0,12,0,12);skn.AnchorPoint=Vector2.new(0.5,0.5)
+    skn.Position=UDim2.new((val-mn)/(mx-mn),0,0.5,0);skn.BackgroundColor3=Color3.new(1,1,1);skn.BorderSizePixel=0;skn.ZIndex=2;skn.Parent=sb
+    Instance.new("UICorner",skn).CornerRadius=UDim.new(1,0)
     local dr=false
     local ib=Instance.new("TextButton");ib.Size=UDim2.new(1,0,0,20);ib.Position=UDim2.new(0,0,0,24);ib.BackgroundTransparency=1;ib.Text="";ib.Parent=fr
     local function Up(x)
         local rel=math.clamp((x-sb.AbsolutePosition.X)/sb.AbsoluteSize.X,0,1)
-        val=math.floor(mn+(mx-mn)*rel);sf.Size=UDim2.new(rel,0,1,0);kn.Position=UDim2.new(rel,0,0.5,0)
+        val=math.floor(mn+(mx-mn)*rel);sf.Size=UDim2.new(rel,0,1,0);skn.Position=UDim2.new(rel,0,0.5,0)
         vl.Text=tostring(val);cb(val)
     end
     ib.MouseButton1Down:Connect(function() dr=true end)
@@ -482,19 +515,15 @@ end
 do
     local dg,ds,sp
     TB.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dg=true;ds=i.Position;sp=MF.Position end end)
-    Trk(UserInputService.InputChanged:Connect(function(i)
-        if dg and i.UserInputType==Enum.UserInputType.MouseMovement then
-            local d=i.Position-ds;MF.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y)
-        end
-    end))
+    Trk(UserInputService.InputChanged:Connect(function(i) if dg and i.UserInputType==Enum.UserInputType.MouseMovement then local d=i.Position-ds;MF.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y) end end))
     Trk(UserInputService.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dg=false end end))
 end
 
 local exp=true
-mb.MouseButton1Click:Connect(function()
+mmb.MouseButton1Click:Connect(function()
     exp=not exp
     TweenService:Create(MF,TweenInfo.new(0.25,Enum.EasingStyle.Quad),{Size=exp and UDim2.new(0,280,0,420) or UDim2.new(0,280,0,32)}):Play()
-    mb.Text=exp and "-" or "+"
+    mmb.Text=exp and "-" or "+"
 end)
 
 Sec("Geral")
@@ -524,8 +553,8 @@ local function Cleanup()
     if RC then RC:Disconnect() end
     for _,c in ipairs(Conns) do pcall(function() c:Disconnect() end) end
     for model in pairs(Tracked) do UntrackModel(model) end
-    Tracked={}
+    Tracked={};CharToPlayer={}
     if SG then SG:Destroy() end
 end
 
-getgenv().PF_ESP={Config=Config,Cleanup=Cleanup,GUI=SG,Tracked=Tracked}
+getgenv().PF_ESP={Config=Config,Cleanup=Cleanup,GUI=SG}
